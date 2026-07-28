@@ -10,6 +10,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 import requests
+import base64
 from urllib.parse import unquote, urlparse, parse_qs
 from seleniumbase import SB
 
@@ -47,6 +48,11 @@ GMAIL_PASSWORD = _account[1].strip()
 # 代理配置
 HY2_PROXY_URL = os.getenv('HY2_PROXY_URL', "")
 SOCKS_PORT = int(os.getenv('SOCKS_PORT', '51080'))
+
+# sing-box / NODE_LINK 配置
+NODE_LINK = os.getenv('NODE_LINK', '').strip()
+SINGBOX_ENABLE = os.getenv('SINGBOX_ENABLE', '0').strip()  # '1' 以启用
+SINGBOX_SOCKS_PORT = int(os.getenv('SINGBOX_SOCKS_PORT', '1080'))
 
 # 邮箱掩码
 MASKED_EMAIL = mask_email(KERIT_EMAIL)
@@ -139,8 +145,121 @@ class Hy2Proxy:
         return f"socks5://127.0.0.1:{SOCKS_PORT}"
 
 
+# ============================================================
+# sing-box 管理器（通过 NODE_LINK）
+# ============================================================
+
+class SingboxManager:
+    """简单的 sing-box 管理器：拉取 NODE_LINK，写配置并尝试本地启动 sing-box 客户端"""
+    def __init__(self, node_link: str):
+        self.node_link = node_link
+        self.proc = None
+        self.cfg_path = "/etc/sing-box/config.json"
+        self.fallback_cfg_path = "/tmp/sing-box-config.json"
+        self.listen_port = SINGBOX_SOCKS_PORT
+
+    def fetch(self) -> str:
+        if not self.node_link:
+            raise ValueError("NODE_LINK 未配置")
+        text = None
+        if self.node_link.startswith("http://") or self.node_link.startswith("https://"):
+            r = requests.get(self.node_link, timeout=20)
+            r.raise_for_status()
+            text = r.text
+        else:
+            # 可能是 base64 或直接内容
+            text = self.node_link
+        # 如果看起来像 base64（无空格并长度对），尝试解码一次
+        try:
+            if not text.strip().startswith("{") and len(text.strip()) % 4 == 0:
+                dec = base64.b64decode(text).decode('utf-8')
+                if dec.strip():
+                    text = dec
+        except Exception:
+            pass
+        return text
+
+    def write_config(self, cfg_obj: dict, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(cfg_obj, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def start(self) -> bool:
+        print("📡 处理 NODE_LINK，尝试配置 sing-box…")
+        try:
+            raw = self.fetch()
+        except Exception as e:
+            print(f"❌ 拉取 NODE_LINK 失败: {e}")
+            return False
+
+        # 尝试解析为 JSON 配置
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+
+        target_path = self.cfg_path
+        used_fallback = False
+        if isinstance(obj, dict) and ("inbounds" in obj or "outbounds" in obj or "log" in obj):
+            try:
+                self.write_config(obj, target_path)
+                print(f"✅ 已写入 sing-box 配置到 {target_path}")
+            except PermissionError:
+                # 回退到 /tmp
+                target_path = self.fallback_cfg_path
+                used_fallback = True
+                self.write_config(obj, target_path)
+                print(f"⚠️ 无法写入系统路径，已写入 {target_path}")
+        else:
+            # 无法识别为完整 config，保存原始并退出（可以在此扩展解析 vmess/vless/ss）
+            raw_path = "/tmp/singbox_nodes_raw.txt"
+            with open(raw_path, 'w') as f:
+                f.write(raw)
+            print(f"⚠️ NODE_LINK 内容不是完整 sing-box JSON，已保存原始内容到 {raw_path}")
+            return False
+
+        # 尝试启动 sing-box（如果可用）
+        cmd = ["sing-box", "run", "-c", target_path]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        except FileNotFoundError:
+            print("⚠️ 本地未找到 sing-box 可执行文件，配置已写入，请手动启动 sing-box")
+            return True
+
+        # 等待 socks 端口就绪
+        for _ in range(12):
+            time.sleep(1)
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", self.listen_port)) == 0:
+                    print(f"✅ sing-box SOCKS5 已就绪 (127.0.0.1:{self.listen_port})")
+                    return True
+        print("⚠️ sing-box 启动超时或未监听指定端口")
+        return False
+
+    def stop(self):
+        if self.proc:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                print("🛑 sing-box 已停止")
+            except Exception:
+                pass
+
+    @property
+    def proxy(self):
+        return f"socks5://127.0.0.1:{self.listen_port}"
+
+
 def get_proxy_manager():
-    """根据环境变量判断是否需要使用代理"""
+    """根据环境变量判断是否需要使用代理：优先使用 SINGBOX (若启用并配置 NODE_LINK)，否则使用 HY2"""
+    if SINGBOX_ENABLE == '1' and NODE_LINK:
+        return SingboxManager(NODE_LINK)
     if HY2_PROXY_URL:
         return Hy2Proxy(HY2_PROXY_URL)
     return None
@@ -174,17 +293,13 @@ def check_ip(proxy: str = None) -> str:
 
 def start_proxy_with_retry(max_retries=3):
     """启动代理，失败时重试"""
-    if not HY2_PROXY_URL:
-        print("⚠️ 未配置代理 URL，使用直连模式")
-        return None, None
-    
+    # 不再单独检查 HY2_PROXY_URL，这里统一通过 get_proxy_manager
     proxy_manager = get_proxy_manager()
-    proxy_url = None
-    
     if not proxy_manager:
-        print("⚠️ 代理管理器初始化失败，使用直连模式")
+        print("⚠️ 未配置代理管理器，使用直连模式")
         return None, None
-    
+
+    proxy_url = None
     for attempt in range(1, max_retries + 1):
         print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
         if proxy_manager.start():
@@ -197,7 +312,6 @@ def start_proxy_with_retry(max_retries=3):
                 time.sleep(5)
             else:
                 print("⚠️ 代理启动失败，继续使用直连模式")
-    
     return None, None
 
 
