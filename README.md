@@ -11,6 +11,8 @@
 | `KERIT_ACCOUNT` | ✅ 必填 | 🧾 Kerit 登录邮箱和 Gmail 应用密码，用英文逗号分隔 | `example@gmail.com,abcdabcdabcdabcd` |
 | `HY2_PROXY_URL` | ✅ 必填 | 🌐 hy2 代理地址,代码里会自动由hy2生成一个临时的socks5，用完即刻销毁 | `hysteria2://[auth]@[host]:[port]/?sni=xxx&insecure=1&alpn=h3` |
 | `TG_BOT` | 🔲 可选 | 📨 Telegram 推送，Chat ID 和 Bot Token 用英文逗号分隔 | `987654321,123456:AAFxxx` |
+| `DISCORD_TOKEN` | 🔲 可选 | Discord Bot Token，用于向指定频道发送通知（Bot Token，不是用户 Token） | `Bot_xxx` |
+| `DISCORD_CHANNEL` | 🔲 可选 | 目标频道 ID（整数字符串），例如 `123456789012345678` |
 
 ## 📝 Gmail 应用密码生成方式
 Google 账号 → 安全性 → 两步验证（需先开启）→ 应用密码 → 选择"邮件" → 生成 → 将 16 位密码填入 Secret。

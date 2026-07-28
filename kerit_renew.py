@@ -13,6 +13,13 @@ import requests
 from urllib.parse import unquote, urlparse, parse_qs
 from seleniumbase import SB
 
+import asyncio
+import threading
+try:
+    import discord
+except Exception:
+    discord = None  # 如果未安装 discord.py，则保持回退
+
 # ============================================================
 # 工具函数
 # ============================================================
@@ -55,6 +62,16 @@ if _tg_raw and "," in _tg_raw:
 else:
     TG_CHAT_ID = ""
     TG_TOKEN   = ""
+
+# Discord 配置（可选）
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL", "").strip()  # 目标频道 ID（字符串）
+
+# Discord 客户端管理变量
+discord_client = None
+discord_loop = None
+discord_thread = None
+discord_ready_event = threading.Event()
 
 
 # ============================================================
@@ -185,6 +202,105 @@ def start_proxy_with_retry(max_retries=3):
 
 
 # ============================================================
+# Discord 后台客户端管理
+# ============================================================
+
+def start_discord_bot():
+    """在后台线程启动 discord.Client（如果配置了 token 和库存在）"""
+    global discord_client, discord_loop, discord_thread
+
+    if not DISCORD_TOKEN or not DISCORD_CHANNEL:
+        print("⚠️ DISCORD_TOKEN 或 DISCORD_CHANNEL 未配置，跳过 Discord 推送")
+        return
+
+    if discord is None:
+        print("⚠️ discord.py 未安装，无法启动 Discord Bot。请在 requirements.txt 添加 discord.py")
+        return
+
+    if discord_client:
+        print("ℹ️ Discord 客户端已启动")
+        return
+
+    discord_loop = asyncio.new_event_loop()
+
+    def _run_client(loop):
+        global discord_client
+        asyncio.set_event_loop(loop)
+        intents = discord.Intents.default()
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            try:
+                print(f"✅ Discord bot logged in as {client.user} (id={client.user.id})")
+            except Exception:
+                print("✅ Discord bot logged in")
+            discord_ready_event.set()
+
+        discord_client = client
+        try:
+            loop.run_until_complete(client.start(DISCORD_TOKEN))
+        except Exception as e:
+            print(f"⚠️ Discord 客户端异常: {e}")
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+
+    discord_thread = threading.Thread(target=_run_client, args=(discord_loop,), daemon=True)
+    discord_thread.start()
+
+    # 等待短时间以确认 on_ready 被触发
+    if not discord_ready_event.wait(timeout=10):
+        print("⚠️ Discord 登录超时（10s），可能仍在尝试连接或 token 无效")
+
+
+def stop_discord_bot(timeout=5):
+    """优雅停止 Discord 客户端"""
+    global discord_client, discord_loop, discord_thread
+    if not discord_client or not discord_loop:
+        return
+    try:
+        fut = asyncio.run_coroutine_threadsafe(discord_client.close(), discord_loop)
+        fut.result(timeout=timeout)
+    except Exception as e:
+        print(f"⚠️ 停止 Discord 客户端时发生异常: {e}")
+    finally:
+        discord_ready_event.clear()
+        discord_client = None
+        discord_loop = None
+
+
+def send_discord_message(message: str):
+    """线程安全地向指定频道发送消息"""
+    global discord_client, discord_loop
+    if not DISCORD_TOKEN or not DISCORD_CHANNEL:
+        return
+    if discord is None:
+        return
+    if not discord_client or not discord_loop:
+        print("⚠️ Discord 客户端尚未就绪，跳过推送")
+        return
+
+    async def _send():
+        try:
+            cid = int(DISCORD_CHANNEL)
+            ch = discord_client.get_channel(cid)
+            if ch is None:
+                ch = await discord_client.fetch_channel(cid)
+            await ch.send(message)
+            print("✅ Discord 推送成功")
+        except Exception as e:
+            print(f"⚠️ Discord 推送失败: {e}")
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), discord_loop)
+    except Exception as e:
+        print(f"⚠️ 提交 Discord 发��任务失败: {e}")
+
+
+# ============================================================
 # TG 推送
 # ============================================================
 
@@ -213,6 +329,12 @@ def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
     msg = "\n".join(lines)
     if not TG_TOKEN or not TG_CHAT_ID:
         print("⚠️ TG未配置，跳过推送")
+        # 即便 TG 未配置，仍尝试 Discord（如果配置了��
+        try:
+            plain_msg = re.sub(r'<[^>]+>', '', msg)
+            send_discord_message(plain_msg)
+        except Exception:
+            pass
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
@@ -224,8 +346,20 @@ def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
         req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             print(f"📨 TG推送成功")
+            # 同时发 Discord
+            try:
+                plain_msg = re.sub(r'<[^>]+>', '', msg)
+                send_discord_message(plain_msg)
+            except Exception:
+                pass
     except Exception as e:
         print(f"⚠️ TG推送失败：{e}")
+        # TG 失败时仍尝试 Discord
+        try:
+            plain_msg = re.sub(r'<[^>]+>', '', msg)
+            send_discord_message(plain_msg)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -252,7 +386,7 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
     for f in folder_list:
         decoded = f.decode("utf-8", errors="ignore")
         if any(k in decoded for k in ["Spam", "Junk", "垃圾", "spam", "junk"]):
-            match = re.search(r'"([^"]+)"\s*$', decoded)
+            match = re.search(r'"([^\"]+)"\s*$', decoded)
             if not match:
                 match = re.search(r'(\S+)\s*$', decoded)
             if match:
@@ -356,6 +490,7 @@ EXPAND_POPUP_JS = """
     });
 })();
 """
+# (后续代码保持原样...)
 
 def xdotool_click(x, y):
     x, y = int(x), int(y)
@@ -708,6 +843,12 @@ def do_renew(sb, ip_info=None, email=None):
 def run_script():
     print("🔧 启动浏览器...")
 
+    # 启动 Discord（如果配置）
+    try:
+        start_discord_bot()
+    except Exception as e:
+        print(f"⚠️ 启动 Discord 客户端失败: {e}")
+
     # 初始化代理
     proxy_manager, proxy_url = start_proxy_with_retry(max_retries=3)
     ip_info = ""
@@ -787,7 +928,7 @@ def run_script():
             try:
                 sb.wait_for_element_visible('.otp-input', timeout=30)
             except Exception:
-                print("❌ OTP框加载失败")
+                print("❌ OTP��加载失败")
                 sb.save_screenshot("kerit_no_otp.png")
                 send_tg("❌ OTP框加载失败", ip_info=ip_info, email=MASKED_EMAIL)
                 return
@@ -867,6 +1008,11 @@ def run_script():
     finally:
         if proxy_manager:
             proxy_manager.stop()
+        # 停止 Discord 客户端
+        try:
+            stop_discord_bot()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
