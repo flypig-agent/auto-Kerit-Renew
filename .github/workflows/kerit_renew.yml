@@ -37,6 +37,7 @@ jobs:
             scrot
       - name: 🐍 安装 Python 依赖
         run: |
+          pip install -r requirements.txt
           pip install seleniumbase
           seleniumbase install uc_driver
       - name: ⏳ 添加随机延迟
@@ -51,6 +52,8 @@ jobs:
           HY2_PROXY_URL: ${{ secrets.HY2_PROXY_URL }}
           SOCKS_PORT: ${{ secrets.SOCKS_PORT || '51080' }}
           TG_BOT: ${{ secrets.TG_BOT }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_CHANNEL: ${{ secrets.DISCORD_CHANNEL }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python kerit_renew.py
       - name: 📸 上传截图
